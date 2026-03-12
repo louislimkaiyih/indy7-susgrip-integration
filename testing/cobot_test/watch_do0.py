@@ -1,7 +1,7 @@
 import time
 from neuromeka import IndyDCP3
 
-ROBOT_IP = "192.168.0.157"
+ROBOT_IP = "192.168.1.75"
 indy = IndyDCP3(ROBOT_IP)
 
 print("Watching DO... Toggle DO0 in CONTY to test.")

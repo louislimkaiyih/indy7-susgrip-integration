@@ -1,7 +1,7 @@
 import time
 from neuromeka import IndyDCP3
 
-ROBOT_IP = "192.168.0.157"
+ROBOT_IP = "192.168.1.75"
 DO_ADDR = 0  # DO0
 
 indy = IndyDCP3(ROBOT_IP)

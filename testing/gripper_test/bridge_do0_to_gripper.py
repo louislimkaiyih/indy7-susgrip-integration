@@ -1,7 +1,7 @@
 import time
 from neuromeka import IndyDCP3
 
-ROBOT_IP = "192.168.0.157"
+ROBOT_IP = "192.168.1.75"
 DO_ADDR = 0  # DO0
 
 indy = IndyDCP3(ROBOT_IP)
@@ -29,9 +29,9 @@ while True:
 
     # Only trigger when the value CHANGES (edge trigger)
     if last == 0 and cur == 1:
-        gripper_open()
-    elif last == 1 and cur == 0:
         gripper_close()
+    elif last == 1 and cur == 0:
+        gripper_open()
 
     last = cur
     time.sleep(0.05)
