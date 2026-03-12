@@ -136,8 +136,25 @@ class SusGripClient:
         mm = int(mm)
         # clamp to your practical safe range
         mm = max(self.close_min_mm, min(mm, self.open_max_mm))
+
         self._write_holding(self.REG_SET_POSITION, mm)
-        return self.wait_move_done() if wait else True
+
+        if not wait:
+            return True
+
+        ok = self.wait_move_done()
+        if not ok:
+            # Watchdog: if motion didn't finish in time, try to stop immediately.
+            try:
+                self.emcy_stop()
+            except Exception:
+                # If comms are broken, we might not be able to stop via Modbus.
+                # In real life safety: cut 24V power.
+                pass
+
+            raise TimeoutError(f"SusGrip move timeout: target={mm}mm (sent EMCY STOP).")
+
+        return True
 
     def open(self, wait: bool = True) -> bool:
         return self.set_position_mm(self.open_max_mm, wait=wait)

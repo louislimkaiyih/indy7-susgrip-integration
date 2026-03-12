@@ -1,5 +1,5 @@
 import time
-from susgrip_client import SusGripClient
+from scripts.gripper.susgrip_client import SusGripClient
 
 
 def print_status(tag, s):
