@@ -1,6 +1,71 @@
-import pyrealsense2 as rs
-import numpy as np
+import time
+
 import cv2
+import numpy as np
+import pyrealsense2 as rs
+
+
+DEPTH_STREAM_SIZE = (848, 480)
+COLOR_STREAM_SIZE = (848, 480)
+DEPTH_FPS = 30
+COLOR_FPS = 30
+
+LOCK_RGB_SETTINGS = True
+RGB_EXPOSURE = 1250
+RGB_GAIN = 0
+RGB_WHITE_BALANCE = 5200.0
+
+FRAME_SKIP_COUNT = 78
+REQUIRED_STABLE_FRAMES = 3
+MAX_LOST_FRAMES = 5
+
+MIN_PICK_CONFIDENCE = 0.18
+MIN_EDGE_SCORE = 0.18
+
+NEAR_THRESHOLD_M = 0.47
+COMBINED_CLOSE_SIZE = (7, 7)
+FOREGROUND_CLOSE_SIZE = (9, 9)
+FOREGROUND_DILATE_SIZE = (3, 3)
+
+MIN_CONTOUR_AREA = 2500
+MAX_CONTOUR_AREA = 14000
+MIN_ASPECT_RATIO = 1.8
+MAX_ASPECT_RATIO = 5.5
+MIN_FILL_RATIO = 0.45
+MARGIN_PX = 8
+DEPTH_WINDOW_SIZE = 5
+
+USE_FIXED_ROI = False
+ROI_POLYGON_NORM = np.array(
+    [
+        [0.12, 0.06],
+        [0.84, 0.06],
+        [0.84, 0.94],
+        [0.12, 0.94],
+    ],
+    dtype=np.float32,
+)
+
+HSV_BLUE_LOWER = np.array([100, 100, 80])
+HSV_BLUE_UPPER = np.array([115, 255, 255])
+HSV_GREEN_LOWER = np.array([65, 75, 40])
+HSV_GREEN_UPPER = np.array([98, 255, 255])
+HSV_YELLOW_LOWER = np.array([10, 40, 20])
+HSV_YELLOW_UPPER = np.array([40, 255, 255])
+
+MERGE_ANGLE_DIFF_DEG = 20.0
+MERGE_DEPTH_DIFF_M = 0.03
+MERGE_PERP_OFFSET_PX = 20.0
+MERGE_AXIS_GAP_PX = 80.0
+
+WIDTH_PROFILE_BIN_COUNT = 24
+END_WIDTH_FRACTION = 0.20
+MIN_CAP_WIDTH_RATIO = 1.12
+CAP_CONSISTENCY_WEIGHT = 0.35
+GRASP_INSET_FRACTION = 0.12
+GRASP_BAND_FRACTION = 0.04
+MIN_PIXELS_PER_WIDTH_BIN = 10
+MIN_PIXELS_IN_GRASP_BAND = 20
 
 
 def build_contour_mask(contour, mask_shape):
@@ -11,10 +76,12 @@ def build_contour_mask(contour, mask_shape):
 
 def build_roi_mask(mask_shape, roi_polygon_norm):
     img_h, img_w = mask_shape
-    roi_polygon_px = np.column_stack((
-        np.round(roi_polygon_norm[:, 0] * img_w),
-        np.round(roi_polygon_norm[:, 1] * img_h),
-    )).astype(np.int32)
+    roi_polygon_px = np.column_stack(
+        (
+            np.round(roi_polygon_norm[:, 0] * img_w),
+            np.round(roi_polygon_norm[:, 1] * img_h),
+        )
+    ).astype(np.int32)
 
     roi_mask = np.zeros(mask_shape, dtype=np.uint8)
     cv2.fillPoly(roi_mask, [roi_polygon_px], 255)
@@ -135,8 +202,8 @@ def compute_shape_metrics(contour):
 
     points_xy = contour.reshape(-1, 2).astype(np.float32)
     projection_min, projection_max = get_projection_interval(points_xy, axis_u)
-    line_start = (np.array(rect[0], dtype=np.float32) - axis_u * (long_side * 0.5))
-    line_end = (np.array(rect[0], dtype=np.float32) + axis_u * (long_side * 0.5))
+    line_start = np.array(rect[0], dtype=np.float32) - axis_u * (long_side * 0.5)
+    line_end = np.array(rect[0], dtype=np.float32) + axis_u * (long_side * 0.5)
 
     return {
         "area": area,
@@ -161,16 +228,28 @@ def compute_shape_metrics(contour):
 def passes_shape_filters(shape_metrics):
     if shape_metrics is None:
         return False
-    if shape_metrics["area"] < min_contour_area or shape_metrics["area"] > max_contour_area:
+    if shape_metrics["area"] < MIN_CONTOUR_AREA or shape_metrics["area"] > MAX_CONTOUR_AREA:
         return False
-    if shape_metrics["aspect_ratio"] < min_aspect_ratio or shape_metrics["aspect_ratio"] > max_aspect_ratio:
+    if (
+        shape_metrics["aspect_ratio"] < MIN_ASPECT_RATIO
+        or shape_metrics["aspect_ratio"] > MAX_ASPECT_RATIO
+    ):
         return False
-    if shape_metrics["fill_ratio"] < min_fill_ratio:
+    if shape_metrics["fill_ratio"] < MIN_FILL_RATIO:
         return False
     return True
 
 
-def build_raw_candidate(contour, depth_image, depth_scale, depth_intrin, blue_mask, green_mask, yellow_mask, mask_shape):
+def build_raw_candidate(
+    contour,
+    depth_image,
+    depth_scale,
+    depth_intrin,
+    blue_mask,
+    green_mask,
+    yellow_mask,
+    mask_shape,
+):
     shape_metrics = compute_shape_metrics(contour)
     if not passes_shape_filters(shape_metrics):
         return None
@@ -181,8 +260,10 @@ def build_raw_candidate(contour, depth_image, depth_scale, depth_intrin, blue_ma
 
     img_h, img_w = mask_shape
     if (
-        cx <= margin or cy <= margin or
-        cx >= img_w - margin or cy >= img_h - margin
+        cx <= MARGIN_PX
+        or cy <= MARGIN_PX
+        or cx >= img_w - MARGIN_PX
+        or cy >= img_h - MARGIN_PX
     ):
         return None
 
@@ -191,13 +272,13 @@ def build_raw_candidate(contour, depth_image, depth_scale, depth_intrin, blue_ma
         depth_scale,
         cx,
         cy,
-        depth_window_size,
+        DEPTH_WINDOW_SIZE,
     )
     if distance_m <= 0:
         return None
 
     point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], distance_m)
-    X_m, Y_m, Z_m = point_3d
+    x_m, y_m, z_m = point_3d
 
     label, box_color = get_dominant_color(
         blue_mask,
@@ -213,9 +294,9 @@ def build_raw_candidate(contour, depth_image, depth_scale, depth_intrin, blue_ma
         "box_color": box_color,
         "cx": cx,
         "cy": cy,
-        "X_m": X_m,
-        "Y_m": Y_m,
-        "Z_m": Z_m,
+        "X_m": x_m,
+        "Y_m": y_m,
+        "Z_m": z_m,
         "distance_m": distance_m,
         **shape_metrics,
     }
@@ -225,20 +306,24 @@ def should_merge_candidates(candidate_a, candidate_b):
     if candidate_a["label"] != candidate_b["label"]:
         return False
 
-    angle_diff = normalize_axis_angle_diff_deg(candidate_a["angle_deg"], candidate_b["angle_deg"])
-    if angle_diff > merge_angle_diff_deg:
+    angle_diff = normalize_axis_angle_diff_deg(
+        candidate_a["angle_deg"], candidate_b["angle_deg"]
+    )
+    if angle_diff > MERGE_ANGLE_DIFF_DEG:
         return False
 
-    if abs(candidate_a["Z_m"] - candidate_b["Z_m"]) > merge_depth_diff_m:
+    if abs(candidate_a["Z_m"] - candidate_b["Z_m"]) > MERGE_DEPTH_DIFF_M:
         return False
 
-    average_angle = average_axis_angle_deg(candidate_a["angle_deg"], candidate_b["angle_deg"])
+    average_angle = average_axis_angle_deg(
+        candidate_a["angle_deg"], candidate_b["angle_deg"]
+    )
     axis_u, perp_u = get_axis_vectors(average_angle)
 
     min_a, max_a = get_projection_interval(candidate_a["points_xy"], axis_u)
     min_b, max_b = get_projection_interval(candidate_b["points_xy"], axis_u)
     axis_gap = get_projection_gap(min_a, max_a, min_b, max_b)
-    if axis_gap > merge_axis_gap_px:
+    if axis_gap > MERGE_AXIS_GAP_PX:
         return False
 
     center_delta = np.array(
@@ -246,7 +331,7 @@ def should_merge_candidates(candidate_a, candidate_b):
         dtype=np.float32,
     )
     perpendicular_offset = abs(float(center_delta @ perp_u))
-    if perpendicular_offset > merge_perp_offset_px:
+    if perpendicular_offset > MERGE_PERP_OFFSET_PX:
         return False
 
     return True
@@ -274,7 +359,9 @@ def group_raw_candidates(raw_candidates):
             for next_idx in range(len(raw_candidates)):
                 if next_idx in visited or next_idx == current_idx:
                     continue
-                if should_merge_candidates(raw_candidates[current_idx], raw_candidates[next_idx]):
+                if should_merge_candidates(
+                    raw_candidates[current_idx], raw_candidates[next_idx]
+                ):
                     queue.append(next_idx)
 
         groups.append(component)
@@ -285,14 +372,20 @@ def group_raw_candidates(raw_candidates):
 def build_merged_contour(candidate_group, mask_shape):
     merged_mask = np.zeros(mask_shape, dtype=np.uint8)
 
-    all_points = np.vstack([candidate["points_xy"] for candidate in candidate_group]).astype(np.int32)
+    all_points = np.vstack(
+        [candidate["points_xy"] for candidate in candidate_group]
+    ).astype(np.int32)
     if len(candidate_group) == 1:
-        cv2.drawContours(merged_mask, [candidate_group[0]["contour"]], -1, 255, thickness=-1)
+        cv2.drawContours(
+            merged_mask, [candidate_group[0]["contour"]], -1, 255, thickness=-1
+        )
     else:
         hull = cv2.convexHull(all_points)
         cv2.drawContours(merged_mask, [hull], -1, 255, thickness=-1)
 
-    contours, _ = cv2.findContours(merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours:
         return None
 
@@ -319,22 +412,28 @@ def analyze_cap_geometry(contour, mask_shape, angle_deg):
     if tube_length <= 1.0:
         return None
 
-    axis_edges = np.linspace(axis_min, axis_max, width_profile_bin_count + 1)
-    width_profile = np.full(width_profile_bin_count, np.nan, dtype=np.float32)
+    axis_edges = np.linspace(axis_min, axis_max, WIDTH_PROFILE_BIN_COUNT + 1)
+    width_profile = np.full(WIDTH_PROFILE_BIN_COUNT, np.nan, dtype=np.float32)
 
-    for idx in range(width_profile_bin_count):
-        if idx == width_profile_bin_count - 1:
-            in_bin = (axis_values >= axis_edges[idx]) & (axis_values <= axis_edges[idx + 1])
+    for idx in range(WIDTH_PROFILE_BIN_COUNT):
+        if idx == WIDTH_PROFILE_BIN_COUNT - 1:
+            in_bin = (axis_values >= axis_edges[idx]) & (
+                axis_values <= axis_edges[idx + 1]
+            )
         else:
-            in_bin = (axis_values >= axis_edges[idx]) & (axis_values < axis_edges[idx + 1])
+            in_bin = (axis_values >= axis_edges[idx]) & (
+                axis_values < axis_edges[idx + 1]
+            )
 
-        if np.count_nonzero(in_bin) < min_pixels_per_width_bin:
+        if np.count_nonzero(in_bin) < MIN_PIXELS_PER_WIDTH_BIN:
             continue
 
         bin_perp_values = perp_values[in_bin]
-        width_profile[idx] = float(np.max(bin_perp_values) - np.min(bin_perp_values))
+        width_profile[idx] = float(
+            np.max(bin_perp_values) - np.min(bin_perp_values)
+        )
 
-    end_bin_count = max(3, int(round(width_profile_bin_count * end_width_fraction)))
+    end_bin_count = max(3, int(round(WIDTH_PROFILE_BIN_COUNT * END_WIDTH_FRACTION)))
     left_widths = width_profile[:end_bin_count]
     right_widths = width_profile[-end_bin_count:]
 
@@ -357,36 +456,40 @@ def analyze_cap_geometry(contour, mask_shape, angle_deg):
         return None
 
     width_ratio = larger_avg / smaller_avg
-    if width_ratio < min_cap_width_ratio:
+    if width_ratio < MIN_CAP_WIDTH_RATIO:
         return None
 
-    left_score = left_avg + cap_consistency_weight * left_std
-    right_score = right_avg + cap_consistency_weight * right_std
+    left_score = left_avg + CAP_CONSISTENCY_WEIGHT * left_std
+    right_score = right_avg + CAP_CONSISTENCY_WEIGHT * right_std
 
     if left_score < right_score:
         cap_end = "axis_min"
         cap_tip_axis_value = axis_min
-        grasp_axis_value = axis_min + grasp_inset_fraction * tube_length
+        grasp_axis_value = axis_min + GRASP_INSET_FRACTION * tube_length
     else:
         cap_end = "axis_max"
         cap_tip_axis_value = axis_max
-        grasp_axis_value = axis_max - grasp_inset_fraction * tube_length
+        grasp_axis_value = axis_max - GRASP_INSET_FRACTION * tube_length
 
-    band_half_width = max(4.0, tube_length * grasp_band_fraction)
+    band_half_width = max(4.0, tube_length * GRASP_BAND_FRACTION)
     in_grasp_band = np.abs(axis_values - grasp_axis_value) <= band_half_width
-    if np.count_nonzero(in_grasp_band) < min_pixels_in_grasp_band:
+    if np.count_nonzero(in_grasp_band) < MIN_PIXELS_IN_GRASP_BAND:
         return None
 
     band_perp_values = perp_values[in_grasp_band]
-    grasp_perp_value = 0.5 * (float(np.min(band_perp_values)) + float(np.max(band_perp_values)))
+    grasp_perp_value = 0.5 * (
+        float(np.min(band_perp_values)) + float(np.max(band_perp_values))
+    )
     grasp_xy = center_xy + axis_u * grasp_axis_value + perp_u * grasp_perp_value
 
     in_tip_band = np.abs(axis_values - cap_tip_axis_value) <= band_half_width
-    if np.count_nonzero(in_tip_band) < min_pixels_in_grasp_band:
+    if np.count_nonzero(in_tip_band) < MIN_PIXELS_IN_GRASP_BAND:
         tip_perp_value = grasp_perp_value
     else:
         tip_perp_values = perp_values[in_tip_band]
-        tip_perp_value = 0.5 * (float(np.min(tip_perp_values)) + float(np.max(tip_perp_values)))
+        tip_perp_value = 0.5 * (
+            float(np.min(tip_perp_values)) + float(np.max(tip_perp_values))
+        )
 
     cap_tip_xy = center_xy + axis_u * cap_tip_axis_value + perp_u * tip_perp_value
     cap_confidence = width_ratio - 1.0
@@ -401,7 +504,17 @@ def analyze_cap_geometry(contour, mask_shape, angle_deg):
     }
 
 
-def build_final_candidate(candidate_group, merged_contour, depth_image, depth_scale, depth_intrin, blue_mask, green_mask, yellow_mask, mask_shape):
+def build_final_candidate(
+    candidate_group,
+    merged_contour,
+    depth_image,
+    depth_scale,
+    depth_intrin,
+    blue_mask,
+    green_mask,
+    yellow_mask,
+    mask_shape,
+):
     shape_metrics = compute_shape_metrics(merged_contour)
     if not passes_shape_filters(shape_metrics):
         return None
@@ -412,8 +525,10 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
 
     img_h, img_w = mask_shape
     if (
-        cx <= margin or cy <= margin or
-        cx >= img_w - margin or cy >= img_h - margin
+        cx <= MARGIN_PX
+        or cy <= MARGIN_PX
+        or cx >= img_w - MARGIN_PX
+        or cy >= img_h - MARGIN_PX
     ):
         return None
 
@@ -422,13 +537,13 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
         depth_scale,
         cx,
         cy,
-        depth_window_size,
+        DEPTH_WINDOW_SIZE,
     )
     if distance_m <= 0:
         return None
 
     point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], distance_m)
-    X_m, Y_m, Z_m = point_3d
+    x_m, y_m, z_m = point_3d
 
     label, box_color = get_dominant_color(
         blue_mask,
@@ -438,15 +553,19 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
         mask_shape,
     )
 
-    cap_geometry = analyze_cap_geometry(merged_contour, mask_shape, shape_metrics["angle_deg"])
+    cap_geometry = analyze_cap_geometry(
+        merged_contour, mask_shape, shape_metrics["angle_deg"]
+    )
     if cap_geometry is None:
         return None
 
     grasp_px = int(round(cap_geometry["grasp_xy"][0]))
     grasp_py = int(round(cap_geometry["grasp_xy"][1]))
     if (
-        grasp_px <= margin or grasp_py <= margin or
-        grasp_px >= img_w - margin or grasp_py >= img_h - margin
+        grasp_px <= MARGIN_PX
+        or grasp_py <= MARGIN_PX
+        or grasp_px >= img_w - MARGIN_PX
+        or grasp_py >= img_h - MARGIN_PX
     ):
         return None
 
@@ -455,13 +574,15 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
         depth_scale,
         grasp_px,
         grasp_py,
-        depth_window_size,
+        DEPTH_WINDOW_SIZE,
     )
     if grasp_distance_m <= 0:
         return None
 
-    grasp_point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [grasp_px, grasp_py], grasp_distance_m)
-    grasp_X_m, grasp_Y_m, grasp_Z_m = grasp_point_3d
+    grasp_point_3d = rs.rs2_deproject_pixel_to_point(
+        depth_intrin, [grasp_px, grasp_py], grasp_distance_m
+    )
+    grasp_x_m, grasp_y_m, grasp_z_m = grasp_point_3d
 
     box_points = cv2.boxPoints(shape_metrics["rect"])
     box_points = np.intp(box_points)
@@ -476,17 +597,17 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
         "box_points": box_points,
         "cx": cx,
         "cy": cy,
-        "X_m": X_m,
-        "Y_m": Y_m,
-        "Z_m": Z_m,
+        "X_m": x_m,
+        "Y_m": y_m,
+        "Z_m": z_m,
         "angle_deg": shape_metrics["angle_deg"],
         "axis_u": shape_metrics["axis_u"],
         "long_side": shape_metrics["long_side"],
         "grasp_px": grasp_px,
         "grasp_py": grasp_py,
-        "grasp_X_m": grasp_X_m,
-        "grasp_Y_m": grasp_Y_m,
-        "grasp_Z_m": grasp_Z_m,
+        "grasp_X_m": grasp_x_m,
+        "grasp_Y_m": grasp_y_m,
+        "grasp_Z_m": grasp_z_m,
         "cap_end": cap_geometry["cap_end"],
         "cap_confidence": cap_geometry["cap_confidence"],
         "cap_tip_px": cap_tip_px,
@@ -498,13 +619,12 @@ def build_final_candidate(candidate_group, merged_contour, depth_image, depth_sc
     }
 
 
-def build_detection_track_key(detection, px_bucket_size=35):
+def build_detection_track_key(detection, px_bucket_size=20):
     return (
         detection["label"],
         int(detection["grasp_px"] / px_bucket_size),
         int(detection["grasp_py"] / px_bucket_size),
     )
-
 
 
 def update_detection_tracks(detections, track_memory, frame_idx, stale_after_frames=12):
@@ -525,9 +645,15 @@ def update_detection_tracks(detections, track_memory, frame_idx, stale_after_fra
         track["last_seen_frame"] = frame_idx
 
         if "ema_grasp_X_m" in track:
-            track["ema_grasp_X_m"] = (1.0 - alpha) * track["ema_grasp_X_m"] + alpha * detection["grasp_X_m"]
-            track["ema_grasp_Y_m"] = (1.0 - alpha) * track["ema_grasp_Y_m"] + alpha * detection["grasp_Y_m"]
-            track["ema_grasp_Z_m"] = (1.0 - alpha) * track["ema_grasp_Z_m"] + alpha * detection["grasp_Z_m"]
+            track["ema_grasp_X_m"] = (
+                (1.0 - alpha) * track["ema_grasp_X_m"] + alpha * detection["grasp_X_m"]
+            )
+            track["ema_grasp_Y_m"] = (
+                (1.0 - alpha) * track["ema_grasp_Y_m"] + alpha * detection["grasp_Y_m"]
+            )
+            track["ema_grasp_Z_m"] = (
+                (1.0 - alpha) * track["ema_grasp_Z_m"] + alpha * detection["grasp_Z_m"]
+            )
         else:
             track["ema_grasp_X_m"] = detection["grasp_X_m"]
             track["ema_grasp_Y_m"] = detection["grasp_Y_m"]
@@ -543,12 +669,12 @@ def update_detection_tracks(detections, track_memory, frame_idx, stale_after_fra
         detection["ema_grasp_Z_m"] = track["ema_grasp_Z_m"]
 
     stale_keys = [
-        key for key, track in track_memory.items()
+        key
+        for key, track in track_memory.items()
         if frame_idx - track.get("last_seen_frame", -999999) > stale_after_frames
     ]
     for key in stale_keys:
         del track_memory[key]
-
 
 
 def compute_edge_margin_score(detection, image_shape, safe_margin_px=90.0):
@@ -562,12 +688,13 @@ def compute_edge_margin_score(detection, image_shape, safe_margin_px=90.0):
     return float(np.clip(edge_distance_px / safe_margin_px, 0.0, 1.0))
 
 
-
 def compute_isolation_score(detection, detections, safe_distance_px=150.0):
     if len(detections) <= 1:
         return 1.0
 
-    this_xy = np.array([detection["grasp_px"], detection["grasp_py"]], dtype=np.float32)
+    this_xy = np.array(
+        [detection["grasp_px"], detection["grasp_py"]], dtype=np.float32
+    )
     min_distance_px = float("inf")
 
     for other in detections:
@@ -583,7 +710,6 @@ def compute_isolation_score(detection, detections, safe_distance_px=150.0):
     return float(np.clip(min_distance_px / safe_distance_px, 0.0, 1.0))
 
 
-
 def attach_pickability_scores(detections, image_shape):
     if not detections:
         return
@@ -594,18 +720,24 @@ def attach_pickability_scores(detections, image_shape):
     depth_span = max(max_depth - min_depth, 1e-6)
 
     for detection in detections:
-        stability_score = float(np.clip(detection.get("stable_frames", 0) / 6.0, 0.0, 1.0))
-        confidence_score = float(np.clip(detection["cap_confidence"] / 0.45, 0.0, 1.0))
+        stability_score = float(
+            np.clip(detection.get("stable_frames", 0) / 6.0, 0.0, 1.0)
+        )
+        confidence_score = float(
+            np.clip(detection["cap_confidence"] / 0.45, 0.0, 1.0)
+        )
         edge_score = compute_edge_margin_score(detection, image_shape)
         isolation_score = compute_isolation_score(detection, detections)
-        depth_score = float(np.clip((max_depth - detection["grasp_Z_m"]) / depth_span, 0.0, 1.0))
+        depth_score = float(
+            np.clip((max_depth - detection["grasp_Z_m"]) / depth_span, 0.0, 1.0)
+        )
 
         pick_score = (
-            0.38 * stability_score +
-            0.27 * confidence_score +
-            0.18 * isolation_score +
-            0.12 * edge_score +
-            0.05 * depth_score
+            0.38 * stability_score
+            + 0.27 * confidence_score
+            + 0.18 * isolation_score
+            + 0.12 * edge_score
+            + 0.05 * depth_score
         )
 
         detection["stability_score"] = stability_score
@@ -616,15 +748,14 @@ def attach_pickability_scores(detections, image_shape):
         detection["pick_score"] = pick_score
 
 
-
 def select_best_detection(detections):
     if not detections:
         return None
 
     pickable_detections = []
     for detection in detections:
-        enough_confidence = detection["cap_confidence"] >= min_pick_confidence
-        enough_edge_margin = detection["edge_score"] >= min_edge_score
+        enough_confidence = detection["cap_confidence"] >= MIN_PICK_CONFIDENCE
+        enough_edge_margin = detection["edge_score"] >= MIN_EDGE_SCORE
         detection["is_pickable"] = bool(enough_confidence and enough_edge_margin)
         if detection["is_pickable"]:
             pickable_detections.append(detection)
@@ -632,7 +763,7 @@ def select_best_detection(detections):
     if not pickable_detections:
         pickable_detections = detections
 
-    candidate = max(
+    return max(
         pickable_detections,
         key=lambda detection: (
             detection["pick_score"],
@@ -641,7 +772,6 @@ def select_best_detection(detections):
             -detection["grasp_Z_m"],
         ),
     )
-    return candidate
 
 
 def draw_detection(color_image, detection):
@@ -663,8 +793,12 @@ def draw_detection(color_image, detection):
         2,
     )
 
-    cv2.circle(color_image, (detection["cap_tip_px"], detection["cap_tip_py"]), 6, (255, 255, 255), 2)
-    cv2.circle(color_image, (detection["grasp_px"], detection["grasp_py"]), 6, (0, 0, 255), -1)
+    cv2.circle(
+        color_image, (detection["cap_tip_px"], detection["cap_tip_py"]), 6, (255, 255, 255), 2
+    )
+    cv2.circle(
+        color_image, (detection["grasp_px"], detection["grasp_py"]), 6, (0, 0, 255), -1
+    )
     cv2.putText(
         color_image,
         "G",
@@ -740,333 +874,430 @@ def draw_detection(color_image, detection):
         )
 
 
-# Create a pipeline object (this manages the camera stream)
-pipeline = rs.pipeline()
-
-# Create a config object (this stores which streams/settings we want)
-config = rs.config()
-
-# Conservative settings for USB 2.x
-config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
-config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
-
-# Create a colorizer object (this will help us visualize depth data)
-colorizer = rs.colorizer()
-align = rs.align(rs.stream.color)
-
-# RGB camera setting test
-lock_rgb_settings = True
-rgb_exposure = 625
-rgb_gain = 45.0
-rgb_white_balance = 5200.0
-
-# Start the camera
-pipeline_profile = pipeline.start(config)
-device = pipeline_profile.get_device()
-
-depth_sensor = device.first_depth_sensor()
-depth_scale = depth_sensor.get_depth_scale()
-
-color_sensor = None
-for s in device.query_sensors():
-    sensor_name = s.get_info(rs.camera_info.name)
-    if "RGB" in sensor_name or "Color" in sensor_name:
-        color_sensor = s
-        break
-if color_sensor is None:
-    raise RuntimeError("Could not find RealSense color sensor.")
-
-# for opt_name, opt in [
-#     ("exposure", rs.option.exposure),
-#     ("gain", rs.option.gain),
-#     ("white_balance", rs.option.white_balance),
-# ]:
-#     if color_sensor.supports(opt):
-#         r = color_sensor.get_option_range(opt)
-#         print(
-#             f"{opt_name}: min={r.min}, max={r.max}, step={r.step}, default={r.default}"
-#         )
-
-if lock_rgb_settings:
-    color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-    color_sensor.set_option(rs.option.exposure, rgb_exposure)
-
-    if color_sensor.supports(rs.option.gain):
-        color_sensor.set_option(rs.option.gain, rgb_gain)
-
-    color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
-    color_sensor.set_option(rs.option.white_balance, rgb_white_balance)
-
-    print(f"Locked RGB exposure = {color_sensor.get_option(rs.option.exposure)}")
-    if color_sensor.supports(rs.option.gain):
-        print(f"Locked RGB gain = {color_sensor.get_option(rs.option.gain)}")
-    print(
-        f"Locked RGB white balance = {color_sensor.get_option(rs.option.white_balance)}"
+def create_camera_session():
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(
+        rs.stream.depth,
+        DEPTH_STREAM_SIZE[0],
+        DEPTH_STREAM_SIZE[1],
+        rs.format.z16,
+        DEPTH_FPS,
+    )
+    config.enable_stream(
+        rs.stream.color,
+        COLOR_STREAM_SIZE[0],
+        COLOR_STREAM_SIZE[1],
+        rs.format.bgr8,
+        COLOR_FPS,
     )
 
-    # The following prints are for verifying that the settings are actually locked, as some cameras may ignore certain settings changes. 
-    #print(
-    #    f"Auto exposure enabled = {color_sensor.get_option(rs.option.enable_auto_exposure)}"
-    #)
-    #print(
-    #    f"Auto white balance enabled = {color_sensor.get_option(rs.option.enable_auto_white_balance)}"
-    #)
+    colorizer = rs.colorizer()
+    align = rs.align(rs.stream.color)
 
-frame_count = 0
-frame_skip_count = 50
+    pipeline_profile = pipeline.start(config)
+    device = pipeline_profile.get_device()
+    depth_sensor = device.first_depth_sensor()
+    depth_scale = depth_sensor.get_depth_scale()
 
-last_target_key = None
-stable_count = 0
-required_stable_frames = 3
-
-locked_target = None
-lost_target_count = 0
-max_lost_frames = 5
-track_memory = {}
-
-min_pick_confidence = 0.18
-min_edge_score = 0.18
-
-
-# Wrist-mounted fixed-pose calibration. Re-measure if the camera pose changes.
-near_threshold_m = 0.47
-combined_close_size = (7, 7)
-foreground_close_size = (9, 9)
-foreground_dilate_size = (3, 3)
-
-min_contour_area = 2500
-max_contour_area = 14000
-min_aspect_ratio = 1.8
-max_aspect_ratio = 5.5
-min_fill_ratio = 0.45
-margin = 8
-depth_window_size = 5
-
-use_fixed_roi = False
-roi_polygon_norm = np.array([
-    [0.12, 0.06],
-    [0.84, 0.06],
-    [0.84, 0.94],
-    [0.12, 0.94],
-], dtype=np.float32)
-
-merge_angle_diff_deg = 20.0
-merge_depth_diff_m = 0.03
-merge_perp_offset_px = 20.0
-merge_axis_gap_px = 80.0
-
-width_profile_bin_count = 24
-end_width_fraction = 0.20
-min_cap_width_ratio = 1.12
-cap_consistency_weight = 0.35
-grasp_inset_fraction = 0.12
-grasp_band_fraction = 0.04
-min_pixels_per_width_bin = 10
-min_pixels_in_grasp_band = 20
-
-try:
-    while True:
-        # Wait for a new set of frames from the camera
-        frames = pipeline.wait_for_frames()
-        frame_count += 1
-        if frame_count < frame_skip_count:
-            continue
-
-        aligned_frames = align.process(frames)
-
-        depth_frame = aligned_frames.get_depth_frame()
-        color_frame = aligned_frames.get_color_frame()
-
-        if not depth_frame or not color_frame:
-            continue
-
-        depth_image = np.asanyarray(depth_frame.get_data())
-        depth_intrin = depth_frame.profile.as_video_stream_profile().intrinsics
-
-        depth_color_frame = colorizer.colorize(depth_frame)
-        depth_colormap = np.asanyarray(depth_color_frame.get_data())
-
-        raw_color_image = np.asanyarray(color_frame.get_data()).copy()
-        display_image = raw_color_image.copy()
-        hsv = cv2.cvtColor(raw_color_image, cv2.COLOR_BGR2HSV)
-
-        if use_fixed_roi:
-            roi_mask, roi_polygon_px = build_roi_mask(depth_image.shape, roi_polygon_norm)
-        else:
-            roi_mask = np.full(depth_image.shape, 255, dtype=np.uint8)
-            roi_polygon_px = None
-
-        lower_blue = np.array([100, 100, 80])
-        upper_blue = np.array([115, 255, 255])
-
-        lower_green = np.array([65, 75, 40])
-        upper_green = np.array([98, 255, 255])
-
-        lower_yellow = np.array([10, 40, 20])
-        upper_yellow = np.array([40, 255, 255])
-
-        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        green_mask = cv2.inRange(hsv, lower_green, upper_green)
-        yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
-        combined_mask = cv2.bitwise_or(blue_mask, green_mask)
-        combined_mask = cv2.bitwise_or(combined_mask, yellow_mask)
-
-        combined_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, combined_close_size)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, combined_close_kernel)
-        combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
-        combined_mask_debug = combined_mask.copy()
-
-        near_threshold_raw = int(near_threshold_m / depth_scale)
-        near_mask = np.where(
-            (depth_image > 0) & (depth_image < near_threshold_raw),
-            255,
-            0,
-        ).astype(np.uint8)
-        near_mask = cv2.bitwise_and(near_mask, roi_mask)
-
-        foreground_mask = cv2.bitwise_and(combined_mask, near_mask)
-
-        foreground_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, foreground_close_size)
-        foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_CLOSE, foreground_close_kernel)
-        foreground_mask_debug = foreground_mask.copy()
-
-        foreground_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, foreground_dilate_size)
-        foreground_mask = cv2.dilate(foreground_mask, foreground_dilate_kernel, iterations=1)
-        foreground_mask = cv2.bitwise_and(foreground_mask, roi_mask)
-
-        contours, _ = cv2.findContours(foreground_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        raw_candidates = []
-        for contour in contours:
-            candidate = build_raw_candidate(
-                contour,
-                depth_image,
-                depth_scale,
-                depth_intrin,
-                blue_mask,
-                green_mask,
-                yellow_mask,
-                foreground_mask.shape,
-            )
-            if candidate is not None:
-                raw_candidates.append(candidate)
-
-        grouped_candidates = group_raw_candidates(raw_candidates)
-        detections = []
-
-        for candidate_group in grouped_candidates:
-            merged_contour = build_merged_contour(candidate_group, foreground_mask.shape)
-            if merged_contour is None:
-                continue
-
-            detection = build_final_candidate(
-                candidate_group,
-                merged_contour,
-                depth_image,
-                depth_scale,
-                depth_intrin,
-                blue_mask,
-                green_mask,
-                yellow_mask,
-                foreground_mask.shape,
-            )
-            if detection is None:
-                continue
-
-            detections.append(detection)
-            draw_detection(display_image, detection)
-
-        if roi_polygon_px is not None:
-            cv2.polylines(display_image, [roi_polygon_px], True, (255, 255, 255), 2)
-
-        target = None
-
-        if detections:
-            update_detection_tracks(detections, track_memory, frame_count)
-            attach_pickability_scores(detections, foreground_mask.shape)
-
-            print("Detections:")
-            for detection in detections:
-                print(
-                    f'{detection["label"]}  parts={detection["part_count"]}  '
-                    f'cx={detection["cx"]}  cy={detection["cy"]}  '
-                    f'GX={detection["grasp_X_m"]:.3f}  GY={detection["grasp_Y_m"]:.3f}  '
-                    f'GZ={detection["grasp_Z_m"]:.3f}  angle={detection["angle_deg"]:.1f}  '
-                    f'cap={detection["cap_end"]}  conf={detection["cap_confidence"]:.2f}  '
-                    f'st={detection.get("stable_frames", 0)}  edge={detection.get("edge_score", 0.0):.2f}  '
-                    f'iso={detection.get("isolation_score", 0.0):.2f}  score={detection.get("pick_score", 0.0):.2f}'
-                )
-
-            candidate = select_best_detection(detections)
-            target_key = candidate["track_key"]
-
-            if target_key == last_target_key:
-                stable_count += 1
-            else:
-                stable_count = 1
-                last_target_key = target_key
-
-            if stable_count >= required_stable_frames:
-                locked_target = candidate.copy()
-                lost_target_count = 0
-
-            print("CANDIDATE:")
-            print(
-                f'{candidate["label"]}  grasp_px={candidate["grasp_px"]}  grasp_py={candidate["grasp_py"]}  '
-                f'GX={candidate["grasp_X_m"]:.3f}  GY={candidate["grasp_Y_m"]:.3f}  '
-                f'GZ={candidate["grasp_Z_m"]:.3f}  angle={candidate["angle_deg"]:.1f}  '
-                f'parts={candidate["part_count"]}  stable_count={stable_count}  '
-                f'pick_score={candidate.get("pick_score", 0.0):.2f}  '
-                f'st={candidate.get("stable_frames", 0)}  conf={candidate.get("confidence_score", 0.0):.2f}  '
-                f'iso={candidate.get("isolation_score", 0.0):.2f}  edge={candidate.get("edge_score", 0.0):.2f}'
-            )
-        else:
-            stable_count = 0
-            last_target_key = None
-
-            if locked_target is not None:
-                lost_target_count += 1
-                if lost_target_count > max_lost_frames:
-                    locked_target = None
-                    lost_target_count = 0
-
-        if locked_target is not None:
-            target = locked_target
-
-            print("TARGET:")
-            print(
-                f'{target["label"]}  grasp_px={target["grasp_px"]}  grasp_py={target["grasp_py"]}  '
-                f'GX={target["grasp_X_m"]:.3f}  GY={target["grasp_Y_m"]:.3f}  '
-                f'GZ={target["grasp_Z_m"]:.3f}  angle={target["angle_deg"]:.1f}  '
-                f'parts={target["part_count"]}'
-            )
-            print("-" * 50)
-
-            cv2.putText(
-                display_image,
-                "TARGET",
-                (target["grasp_px"] + 10, target["grasp_py"] + 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-            )
-
-        cv2.imshow("Color", display_image)
-        cv2.imshow("Blue Mask Raw", blue_mask)
-        cv2.imshow("Green Mask Raw", green_mask)
-        cv2.imshow("Yellow Mask Raw", yellow_mask)
-        cv2.imshow("Combined Mask", combined_mask)
-
-        #cv2.imshow("Near Mask", near_mask)
-        cv2.imshow("Foreground Mask", foreground_mask)
-        #cv2.imshow("Depth", depth_colormap)
-
-        key = cv2.waitKey(1)
-        if key == 27:
+    color_sensor = None
+    for sensor in device.query_sensors():
+        sensor_name = sensor.get_info(rs.camera_info.name)
+        if "RGB" in sensor_name or "Color" in sensor_name:
+            color_sensor = sensor
             break
 
-finally:
-    pipeline.stop()
-    cv2.destroyAllWindows()
+    if color_sensor is None:
+        pipeline.stop()
+        raise RuntimeError("Could not find RealSense color sensor.")
+
+    if LOCK_RGB_SETTINGS:
+        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        color_sensor.set_option(rs.option.exposure, RGB_EXPOSURE)
+
+        if color_sensor.supports(rs.option.gain):
+            color_sensor.set_option(rs.option.gain, RGB_GAIN)
+
+        color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+        color_sensor.set_option(rs.option.white_balance, RGB_WHITE_BALANCE)
+
+        print(f"Locked RGB exposure = {color_sensor.get_option(rs.option.exposure)}")
+        if color_sensor.supports(rs.option.gain):
+            print(f"Locked RGB gain = {color_sensor.get_option(rs.option.gain)}")
+        print(
+            "Locked RGB white balance = "
+            f"{color_sensor.get_option(rs.option.white_balance)}"
+        )
+
+    return {
+        "pipeline": pipeline,
+        "align": align,
+        "colorizer": colorizer,
+        "depth_scale": depth_scale,
+        "warmup_done": False,
+    }
+
+
+def close_camera_session(session, destroy_windows=True):
+    if session is None:
+        return
+
+    pipeline = session.get("pipeline")
+    if pipeline is not None:
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
+
+    if destroy_windows:
+        cv2.destroyAllWindows()
+
+
+def process_frame(session):
+    frames = session["pipeline"].wait_for_frames()
+    aligned_frames = session["align"].process(frames)
+
+    depth_frame = aligned_frames.get_depth_frame()
+    color_frame = aligned_frames.get_color_frame()
+    if not depth_frame or not color_frame:
+        return None
+
+    depth_image = np.asanyarray(depth_frame.get_data())
+    depth_intrin = depth_frame.profile.as_video_stream_profile().intrinsics
+
+    depth_color_frame = session["colorizer"].colorize(depth_frame)
+    depth_colormap = np.asanyarray(depth_color_frame.get_data())
+
+    raw_color_image = np.asanyarray(color_frame.get_data()).copy()
+    display_image = raw_color_image.copy()
+    hsv = cv2.cvtColor(raw_color_image, cv2.COLOR_BGR2HSV)
+
+    if USE_FIXED_ROI:
+        roi_mask, roi_polygon_px = build_roi_mask(depth_image.shape, ROI_POLYGON_NORM)
+    else:
+        roi_mask = np.full(depth_image.shape, 255, dtype=np.uint8)
+        roi_polygon_px = None
+
+    blue_mask = cv2.inRange(hsv, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+    green_mask = cv2.inRange(hsv, HSV_GREEN_LOWER, HSV_GREEN_UPPER)
+    yellow_mask = cv2.inRange(hsv, HSV_YELLOW_LOWER, HSV_YELLOW_UPPER)
+
+    combined_mask = cv2.bitwise_or(blue_mask, green_mask)
+    combined_mask = cv2.bitwise_or(combined_mask, yellow_mask)
+    combined_close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, COMBINED_CLOSE_SIZE
+    )
+    combined_mask = cv2.morphologyEx(
+        combined_mask, cv2.MORPH_CLOSE, combined_close_kernel
+    )
+    combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
+
+    near_threshold_raw = int(NEAR_THRESHOLD_M / session["depth_scale"])
+    near_mask = np.where(
+        (depth_image > 0) & (depth_image < near_threshold_raw),
+        255,
+        0,
+    ).astype(np.uint8)
+    near_mask = cv2.bitwise_and(near_mask, roi_mask)
+
+    foreground_mask = cv2.bitwise_and(combined_mask, near_mask)
+    foreground_close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, FOREGROUND_CLOSE_SIZE
+    )
+    foreground_mask = cv2.morphologyEx(
+        foreground_mask, cv2.MORPH_CLOSE, foreground_close_kernel
+    )
+    foreground_dilate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, FOREGROUND_DILATE_SIZE
+    )
+    foreground_mask = cv2.dilate(
+        foreground_mask, foreground_dilate_kernel, iterations=1
+    )
+    foreground_mask = cv2.bitwise_and(foreground_mask, roi_mask)
+
+    contours, _ = cv2.findContours(
+        foreground_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    raw_candidates = []
+    for contour in contours:
+        candidate = build_raw_candidate(
+            contour,
+            depth_image,
+            session["depth_scale"],
+            depth_intrin,
+            blue_mask,
+            green_mask,
+            yellow_mask,
+            foreground_mask.shape,
+        )
+        if candidate is not None:
+            raw_candidates.append(candidate)
+
+    grouped_candidates = group_raw_candidates(raw_candidates)
+    detections = []
+
+    for candidate_group in grouped_candidates:
+        merged_contour = build_merged_contour(candidate_group, foreground_mask.shape)
+        if merged_contour is None:
+            continue
+
+        detection = build_final_candidate(
+            candidate_group,
+            merged_contour,
+            depth_image,
+            session["depth_scale"],
+            depth_intrin,
+            blue_mask,
+            green_mask,
+            yellow_mask,
+            foreground_mask.shape,
+        )
+        if detection is None:
+            continue
+
+        detections.append(detection)
+        draw_detection(display_image, detection)
+
+    if roi_polygon_px is not None:
+        cv2.polylines(display_image, [roi_polygon_px], True, (255, 255, 255), 2)
+
+    return {
+        "display_image": display_image,
+        "blue_mask": blue_mask,
+        "green_mask": green_mask,
+        "yellow_mask": yellow_mask,
+        "combined_mask": combined_mask,
+        "foreground_mask": foreground_mask,
+        "depth_colormap": depth_colormap,
+        "detections": detections,
+    }
+
+
+def show_debug_views(frame_data):
+    cv2.imshow("Color", frame_data["display_image"])
+    cv2.imshow("Blue Mask Raw", frame_data["blue_mask"])
+    cv2.imshow("Green Mask Raw", frame_data["green_mask"])
+    cv2.imshow("Yellow Mask Raw", frame_data["yellow_mask"])
+    cv2.imshow("Combined Mask", frame_data["combined_mask"])
+    cv2.imshow("Foreground Mask", frame_data["foreground_mask"])
+
+
+def draw_locked_target_banner(color_image, target):
+    cv2.putText(
+        color_image,
+        "TARGET",
+        (target["grasp_px"] + 10, target["grasp_py"] + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
+
+
+def print_detection_list(detections):
+    print("Detections:")
+    for detection in detections:
+        print(
+            f'{detection["label"]}  parts={detection["part_count"]}  '
+            f'cx={detection["cx"]}  cy={detection["cy"]}  '
+            f'GX={detection["grasp_X_m"]:.3f}  GY={detection["grasp_Y_m"]:.3f}  '
+            f'GZ={detection["grasp_Z_m"]:.3f}  angle={detection["angle_deg"]:.1f}  '
+            f'cap={detection["cap_end"]}  conf={detection["cap_confidence"]:.2f}  '
+            f'st={detection.get("stable_frames", 0)}  '
+            f'edge={detection.get("edge_score", 0.0):.2f}  '
+            f'iso={detection.get("isolation_score", 0.0):.2f}  '
+            f'score={detection.get("pick_score", 0.0):.2f}'
+        )
+
+
+def print_candidate(candidate, stable_count):
+    print("CANDIDATE:")
+    print(
+        f'{candidate["label"]}  grasp_px={candidate["grasp_px"]}  '
+        f'grasp_py={candidate["grasp_py"]}  '
+        f'GX={candidate["grasp_X_m"]:.3f}  GY={candidate["grasp_Y_m"]:.3f}  '
+        f'GZ={candidate["grasp_Z_m"]:.3f}  angle={candidate["angle_deg"]:.1f}  '
+        f'parts={candidate["part_count"]}  stable_count={stable_count}  '
+        f'pick_score={candidate.get("pick_score", 0.0):.2f}  '
+        f'st={candidate.get("stable_frames", 0)}  '
+        f'conf={candidate.get("confidence_score", 0.0):.2f}  '
+        f'iso={candidate.get("isolation_score", 0.0):.2f}  '
+        f'edge={candidate.get("edge_score", 0.0):.2f}'
+    )
+
+
+def print_target(target):
+    print("TARGET:")
+    print(
+        f'{target["label"]}  grasp_px={target["grasp_px"]}  '
+        f'grasp_py={target["grasp_py"]}  '
+        f'GX={target["grasp_X_m"]:.3f}  GY={target["grasp_Y_m"]:.3f}  '
+        f'GZ={target["grasp_Z_m"]:.3f}  angle={target["angle_deg"]:.1f}  '
+        f'parts={target["part_count"]}'
+    )
+    print("-" * 50)
+
+
+def snapshot_target(target):
+    return {
+        "label": str(target["label"]),
+        "grasp_X_m": float(target["grasp_X_m"]),
+        "grasp_Y_m": float(target["grasp_Y_m"]),
+        "grasp_Z_m": float(target["grasp_Z_m"]),
+        "angle_deg": float(target["angle_deg"]),
+        "grasp_px": int(target["grasp_px"]),
+        "grasp_py": int(target["grasp_py"]),
+        "pick_score": float(target.get("pick_score", 0.0)),
+        "stable_frames": int(target.get("stable_frames", 0)),
+    }
+
+
+def run_detection_loop(
+    timeout_s=None,
+    show_windows=True,
+    stop_on_lock=False,
+    session=None,
+    verbose=True,
+    destroy_windows_on_exit=True,
+    frame_skip_count=None,
+    required_stable_frames=None,
+    max_lost_frames=None,
+):
+    owns_session = session is None
+    if session is None:
+        session = create_camera_session()
+
+    frame_count = 0
+    last_target_key = None
+    stable_count = 0
+    locked_target = None
+    lost_target_count = 0
+    track_memory = {}
+    deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
+    effective_frame_skip_count = max(
+        0,
+        FRAME_SKIP_COUNT if frame_skip_count is None else int(frame_skip_count),
+    )
+    effective_required_stable_frames = max(
+        1,
+        REQUIRED_STABLE_FRAMES
+        if required_stable_frames is None
+        else int(required_stable_frames),
+    )
+    effective_max_lost_frames = max(
+        0,
+        MAX_LOST_FRAMES if max_lost_frames is None else int(max_lost_frames),
+    )
+    warmup_frames_remaining = (
+        0
+        if session.get("warmup_done", False)
+        else effective_frame_skip_count
+    )
+
+    try:
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+
+            frame_data = process_frame(session)
+            frame_count += 1
+            if frame_data is None:
+                continue
+
+            if warmup_frames_remaining > 0:
+                warmup_frames_remaining -= 1
+                if warmup_frames_remaining == 0:
+                    session["warmup_done"] = True
+                continue
+
+            session["warmup_done"] = True
+
+            detections = frame_data["detections"]
+
+            if detections:
+                update_detection_tracks(detections, track_memory, frame_count)
+                attach_pickability_scores(
+                    detections, frame_data["foreground_mask"].shape
+                )
+
+                if verbose:
+                    print_detection_list(detections)
+
+                candidate = select_best_detection(detections)
+                target_key = candidate["track_key"]
+
+                if target_key == last_target_key:
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                    last_target_key = target_key
+
+                if stable_count >= effective_required_stable_frames:
+                    locked_target = candidate.copy()
+                    lost_target_count = 0
+
+                if verbose:
+                    print_candidate(candidate, stable_count)
+            else:
+                stable_count = 0
+                last_target_key = None
+
+                if locked_target is not None:
+                    lost_target_count += 1
+                    if lost_target_count > effective_max_lost_frames:
+                        locked_target = None
+                        lost_target_count = 0
+
+            if locked_target is not None:
+                draw_locked_target_banner(frame_data["display_image"], locked_target)
+                if verbose:
+                    print_target(locked_target)
+
+                if stop_on_lock:
+                    if show_windows:
+                        show_debug_views(frame_data)
+                        cv2.waitKey(1)
+                    return snapshot_target(locked_target)
+
+            if show_windows:
+                show_debug_views(frame_data)
+                if cv2.waitKey(1) == 27:
+                    return None
+
+    finally:
+        if owns_session:
+            close_camera_session(session, destroy_windows=destroy_windows_on_exit)
+        elif destroy_windows_on_exit:
+            cv2.destroyAllWindows()
+
+
+def wait_for_locked_target(
+    timeout_s,
+    show_windows=True,
+    session=None,
+    verbose=True,
+    destroy_windows_on_exit=True,
+    frame_skip_count=None,
+    required_stable_frames=None,
+    max_lost_frames=None,
+):
+    return run_detection_loop(
+        timeout_s=timeout_s,
+        show_windows=show_windows,
+        stop_on_lock=True,
+        session=session,
+        verbose=verbose,
+        destroy_windows_on_exit=destroy_windows_on_exit,
+        frame_skip_count=frame_skip_count,
+        required_stable_frames=required_stable_frames,
+        max_lost_frames=max_lost_frames,
+    )
+
+
+def main():
+    run_detection_loop(timeout_s=None, show_windows=True, stop_on_lock=False)
+
+
+if __name__ == "__main__":
+    main()

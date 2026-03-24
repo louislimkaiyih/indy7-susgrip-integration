@@ -58,7 +58,7 @@ if color_sensor is None:
 
 # Freeze color settings to match flat_tube_detect.py baseline
 color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-color_sensor.set_option(rs.option.exposure, 100)
+color_sensor.set_option(rs.option.exposure, 625)
 color_sensor.set_option(rs.option.gain, 0)
 
 color_sensor.set_option(rs.option.enable_auto_white_balance, 0)

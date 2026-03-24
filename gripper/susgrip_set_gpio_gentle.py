@@ -47,16 +47,16 @@ REG_CURRISE_LEVEL = 0x0114  # force rise/decay speed 0..3 (0 gentlest)
 # =======================
 # PRESET: "Delicate cosmetic box" (starting point)
 # =======================
-OPEN_MM = 60
-CLOSE_MM = 10
+OPEN_MM = 120
+CLOSE_MM = 5
 
 OPEN_SPEED = 120  # mm/s (open can be faster)
 OPEN_ACCEL = 800  # mm/s/s
 
-CLOSE_SPEED = 50  # mm/s 
-CLOSE_ACCEL = 150  # mm/s/s (moderate, not snappy)
+CLOSE_SPEED = 100  # mm/s  #50
+CLOSE_ACCEL = 600  # mm/s/s (moderate, not snappy) #150
 
-IO_FORCE_PCT = 5  # start low; raise if it slips
+IO_FORCE_PCT = 50  # start low; raise if it slips #5
 IO_DEFORM_MM = 0  # delicate packaging
 IO_COLLISION = 900  # lower = gentler, higher = less sensitive
 
